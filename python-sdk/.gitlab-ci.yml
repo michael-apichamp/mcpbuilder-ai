@@ -1,0 +1,137 @@
+stages:
+  - pre-build
+  - lint
+  - test
+  - build
+  - publish
+
+# Default environment variables for SDK
+# These can be overridden in GitLab CI/CD settings
+variables:
+  DEV_MCP_CLIENT_URL: "https://mcp-client.dev.apichap.com"
+  PROD_MCP_CLIENT_URL: "https://mcp-client.p.apichap.com"
+
+# Extract version from version.file
+project:version:
+  stage: pre-build
+  script:
+    - source version.file
+    - echo "Version $VERSION"
+    - echo "BUILD_VERSION=$VERSION" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# Base template for Python jobs
+.python-base:
+  image: python:3.11-slim
+  before_script:
+    - pip install poetry
+    - poetry install --no-root  # Don't install the package itself, just dependencies
+
+# Run pytest (dev - develop branch)
+test:pytest:dev:
+  extends: .python-base
+  stage: test
+  variables:
+    MCP_CLIENT_URL: $DEV_MCP_CLIENT_URL
+  script:
+    - poetry run pytest tests/ -v --tb=short
+  allow_failure: true  # Allow failure until tests are written
+  artifacts:
+    reports:
+      junit: pytest-report.xml
+    when: always
+  only:
+    - develop
+
+# Run pytest (prod - main branch)
+test:pytest:prod:
+  extends: .python-base
+  stage: test
+  variables:
+    MCP_CLIENT_URL: $PROD_MCP_CLIENT_URL
+  script:
+    - poetry run pytest tests/ -v --tb=short
+  allow_failure: true  # Allow failure until tests are written
+  artifacts:
+    reports:
+      junit: pytest-report.xml
+    when: always
+  only:
+    - main
+
+# Build the package (development - uses DEV URL)
+build:package:dev:
+  extends: .python-base
+  stage: build
+  script:
+    # Inject DEV URL as default in the SDK
+    - sed -i "s|https://mcp-client.p.apichap.com|${DEV_MCP_CLIENT_URL}|g" src/mcpbuilder/client.py
+    - poetry version $BUILD_VERSION
+    - poetry build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+  only:
+    - develop
+
+# Build the package (production - uses PROD URL)
+build:package:prod:
+  extends: .python-base
+  stage: build
+  script:
+    # PROD URL is already the default in source, no replacement needed
+    - poetry version $BUILD_VERSION
+    - poetry build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+  only:
+    - main
+
+# Publish to PyPI (production - main branch only)
+publish:pypi:
+  extends: .python-base
+  stage: publish
+  dependencies:
+    - build:package:prod
+  script:
+    - poetry config pypi-token.pypi $PYPI_TOKEN
+    - poetry publish
+  only:
+    - main
+  when: manual  # Require manual trigger for PyPI publish
+
+# Publish to TestPyPI (development - develop branch)
+publish:testpypi:
+  extends: .python-base
+  stage: publish
+  dependencies:
+    - build:package:dev
+  before_script:
+    - pip install poetry
+    - poetry config repositories.testpypi https://test.pypi.org/legacy/
+    - poetry config http-basic.testpypi __token__ "${TESTPYPI_TOKEN}"
+  script:
+    - poetry publish -r testpypi
+  only:
+    - develop
+  when: manual  # Require manual trigger for TestPyPI publish
+
+# Alternative: Publish to private GitLab Package Registry
+# Uncomment this if you want to publish to GitLab's package registry instead
+# publish:gitlab:
+#   extends: .python-base
+#   stage: publish
+#   script:
+#     - poetry version $BUILD_VERSION
+#     - poetry build
+#     - poetry config repositories.gitlab "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi"
+#     - poetry config http-basic.gitlab gitlab-ci-token "$CI_JOB_TOKEN"
+#     - poetry publish -r gitlab
+#   only:
+#     - develop
+#     - main

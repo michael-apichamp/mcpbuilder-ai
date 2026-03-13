@@ -1,0 +1,252 @@
+# GitLab CI/CD Pipeline for MCPBuilder TypeScript SDK
+#
+# This pipeline handles:
+# - Code validation (linting, type checking)
+# - Testing
+# - Building
+# - Publishing to npm
+#
+# Triggers:
+# - All stages run on merge requests and main branch pushes
+# - Publish stage only runs on version tags (v*)
+
+stages:
+  - validate
+  - test
+  - build
+  - publish
+
+# Default environment variables for SDK
+# These can be overridden in GitLab CI/CD settings
+variables:
+  NODE_VERSION: "22.14.0"
+  DEV_MCP_CLIENT_URL: "https://mcp-client.dev.apichap.com"
+  PROD_MCP_CLIENT_URL: "https://mcp-client.p.apichap.com"
+
+# Cache node_modules between jobs
+.node_cache: &node_cache
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+    policy: pull-push
+
+# Base configuration for all Node.js jobs
+.node_base:
+  image: node:${NODE_VERSION}
+  <<: *node_cache
+  before_script:
+    # Inject version from version.file into package.json
+    - source version.file
+    - echo "Setting package version to $VERSION"
+    - npm version $VERSION --no-git-tag-version --allow-same-version
+    - npm install -g npm@11.5.1
+    - npm ci
+
+# =============================================================================
+# VALIDATE STAGE
+# =============================================================================
+
+lint:
+  extends: .node_base
+  stage: validate
+  script:
+    - npm run lint
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+type-check:
+  extends: .node_base
+  stage: validate
+  script:
+    - npm run type-check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# TEST STAGE
+# =============================================================================
+
+# Test on develop branch (uses DEV environment)
+test:dev:
+  extends: .node_base
+  stage: test
+  variables:
+    MCP_CLIENT_URL: $DEV_MCP_CLIENT_URL
+  script:
+    - npm run test
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+# Test on main branch (uses PROD environment)
+test:prod:
+  extends: .node_base
+  stage: test
+  variables:
+    MCP_CLIENT_URL: $PROD_MCP_CLIENT_URL
+  script:
+    - npm run test
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+# Test on merge requests (uses DEV environment)
+test:mr:
+  extends: .node_base
+  stage: test
+  variables:
+    MCP_CLIENT_URL: $DEV_MCP_CLIENT_URL
+  script:
+    - npm run test
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# =============================================================================
+# BUILD STAGE
+# =============================================================================
+
+# Build for development (uses DEV URL - already default in source)
+build:dev:
+  extends: .node_base
+  stage: build
+  script:
+    - echo "Checking source for DEV URL..."
+    - grep "mcp-client.dev.apichap.com" src/client.ts
+    - npm run clean
+    - npm run build
+    - ls -la dist/
+    - echo "Verifying DEV URL in build output..."
+    - grep "mcp-client.dev.apichap.com" dist/esm/client.js
+    - echo "DEV URL verified in build"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+# Build for production (replaces DEV URL with PROD URL)
+build:prod:
+  extends: .node_base
+  stage: build
+  script:
+    - echo "Before sed - checking for DEV URL in source..."
+    - grep "DEFAULT_MCP_CLIENT_URL" src/client.ts
+    - sed -i "s|mcp-client.dev.apichap.com|mcp-client.p.apichap.com|g" src/client.ts
+    - echo "After sed - verifying PROD URL in source..."
+    - grep "mcp-client.p.apichap.com" src/client.ts
+    - npm run clean
+    - npm run build
+    - ls -la dist/
+    - echo "Verifying PROD URL in build output..."
+    - grep "mcp-client.p.apichap.com" dist/esm/client.js
+    - echo "PROD URL verified in build"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# PUBLISH STAGE
+# =============================================================================
+
+# Publish to GitLab Package Registry (private, for development/testing)
+# Triggers on: develop branch
+publish:gitlab:
+  extends: .node_base
+  stage: publish
+  dependencies:
+    - build:dev
+  script:
+    # Configure npm for GitLab registry (non-scoped package)
+    - echo "registry=https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/packages/npm/" > ~/.npmrc
+    - echo "//gitlab.com/api/v4/projects/${CI_PROJECT_ID}/packages/npm/:_authToken=${CI_JOB_TOKEN}" >> ~/.npmrc
+    # Add develop pre-release suffix to distinguish from production versions
+    - source version.file
+    - npm version ${VERSION}-develop.${CI_PIPELINE_IID} --no-git-tag-version --allow-same-version
+    - node -p "'Publishing version ' + require('./package.json').version"
+    # Publish to GitLab with develop tag
+    - npm publish --tag develop
+  rules:
+    # Auto-publish on develop branch
+    - if: $CI_COMMIT_BRANCH == "develop"
+      when: manual
+  environment:
+    name: gitlab-packages
+    url: https://gitlab.com/apichamp/apichamp-ai/mcp-integration-sdk/typescript_sdk/-/packages
+
+# Publish to public npm registry (for production releases)
+# Triggers on: main branch or stable version tags
+publish:npm:
+  extends: .node_base
+  stage: publish
+  dependencies:
+    - build:prod
+  id_tokens:
+    NPM_ID_TOKEN:
+      aud: "npm:registry.npmjs.org"
+  script:
+    - node -p "'Publishing version ' + require('./package.json').version"
+    # Verify the package
+    - npm pack --dry-run
+    # Publish to npm
+    - npm publish --access public
+  rules:
+    # Only publish stable versions to public npm (no pre-release tags)
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+      when: manual
+  environment:
+    name: npm
+    url: https://www.npmjs.com/package/mcpbuilder-ai
+
+# =============================================================================
+# OPTIONAL: Version bump (manual trigger)
+# =============================================================================
+
+.version_bump:
+  extends: .node_base
+  stage: publish
+  script:
+    - git config user.email "ci@mcp-builder.ai"
+    - git config user.name "GitLab CI"
+    - 'npm version ${VERSION_TYPE:-patch} -m "chore(release): version %s [skip ci]"'
+    - git push origin HEAD:main --tags
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+  variables:
+    VERSION_TYPE: patch
